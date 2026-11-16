@@ -3,6 +3,7 @@ import importlib
 import importlib.util
 import json
 from pathlib import Path
+import random
 import sqlite3
 import sys
 import tempfile
@@ -163,6 +164,114 @@ class MigrationTests(unittest.TestCase):
                     self.assertEqual(len(catalog.get_model("retrying", 1)["edges"]), 2)
 
 
+def random_silent_model(rng):
+    """Random valid legacy payload: silent loops/cycles, zero weights, gaps."""
+    n = rng.randrange(1, 5)
+    states = ["s" + str(i) for i in range(n)]
+    alphabet = ["x", "y"][: rng.randrange(1, 3)]
+    initial = [str(F(rng.randrange(2))) for _ in states]
+    final = [str(F(rng.randrange(2))) for _ in states]
+    edges = []
+    serial = 0
+    for src in states:
+        budget = F(1, 2)
+        for dst in states:
+            if rng.randrange(3):
+                continue
+            weight = F(rng.randrange(3), 6)
+            if weight > budget:
+                weight = budget
+            budget -= weight
+            edges.append({"id": "e" + str(serial), "src": src, "dst": dst,
+                          "symbol": None, "weight": str(weight)})
+            serial += 1
+        for symbol in alphabet:
+            for dst in states:
+                if rng.randrange(3):
+                    continue
+                weight = F(rng.randrange(4), 4)
+                edges.append({"id": "e" + str(serial), "src": src, "dst": dst,
+                              "symbol": symbol, "weight": str(weight)})
+                serial += 1
+    return {"states": states, "alphabet": alphabet, "initial": initial,
+            "final": final, "edges": edges}
+
+
+class CompilerCrossTests(unittest.TestCase):
+    """Post-upgrade classification vs the independent global-equation reference."""
+
+    def check_model(self, payload, symbols):
+        evidence, visits = business.reference(payload, symbols)
+        with Catalog() as catalog:
+            catalog.save_model("model", payload)
+            catalog.create_task("task", {"only": ("model", None, 1)})
+            self.assertIsNone(upgrade(catalog))
+            with patch.object(sdk1, "load", side_effect=AssertionError("SDK1 load")), \
+                 patch.object(sdk1, "evaluate", side_effect=AssertionError("SDK1 evaluate")):
+                classifier = Classifier(catalog)
+                if not evidence:
+                    with self.assertRaises(ZeroEvidence):
+                        classifier.classify("task", (s for s in symbols))
+                    self.assertEqual(catalog.audits("task"), ())
+                    return
+                result = classifier.classify("task", (s for s in symbols))
+            self.assertEqual(result.evidence, {"only": evidence})
+            self.assertEqual(result.probabilities, {"only": F(1)})
+            self.assertEqual(result.visits, {"only": visits})
+            self.assertEqual(catalog.audits("task")[-1]["result"], {
+                "evidence": result.evidence,
+                "probabilities": result.probabilities,
+                "visits": result.visits,
+            })
+
+    def test_random_models_match_independent_reference(self):
+        rng = random.Random(20261116)
+        inputs = [(), ("x",), ("y",), ("x", "y"), ("y", "x"), ("x", "x", "x")]
+        for case in range(16):
+            payload = random_silent_model(rng)
+            for symbols in inputs:
+                if any(symbol not in payload["alphabet"] for symbol in symbols):
+                    continue
+                with self.subTest(case=case, symbols=symbols):
+                    self.check_model(payload, symbols)
+
+    def test_nasty_model_match_independent_reference(self):
+        payload = {
+            "states": ["a", "b", "c", "ghost"],
+            "alphabet": ["x", "y"],
+            "initial": ["1/2", "1/3", "0", "0"],
+            "final": ["0", "1/4", "1", "0"],
+            "edges": [
+                {"id": "loop-a", "src": "a", "dst": "a", "symbol": None, "weight": "1/3"},
+                {"id": "ab", "src": "a", "dst": "b", "symbol": None, "weight": "1/6"},
+                {"id": "ba", "src": "b", "dst": "a", "symbol": None, "weight": "1/2"},
+                {"id": "zero", "src": "a", "dst": "ghost", "symbol": None, "weight": "0"},
+                {"id": "ax1", "src": "a", "dst": "b", "symbol": "x", "weight": "1/4"},
+                {"id": "ax2", "src": "a", "dst": "b", "symbol": "x", "weight": "1/4"},
+                {"id": "bx", "src": "b", "dst": "c", "symbol": "x", "weight": "1"},
+                {"id": "cy", "src": "c", "dst": "a", "symbol": "y", "weight": "1/2"},
+                {"id": "by", "src": "b", "dst": "b", "symbol": "y", "weight": "1/3"},
+            ],
+        }
+        for symbols in [(), ("x",), ("y",), ("x", "y"), ("y", "x", "x"), ("x", "x")]:
+            with self.subTest(symbols=symbols):
+                self.check_model(payload, symbols)
+
+    def test_empty_alphabet_model(self):
+        payload = {
+            "states": ["only"], "alphabet": [], "initial": ["1"], "final": ["1"],
+            "edges": [{"id": "wait", "src": "only", "dst": "only",
+                       "symbol": None, "weight": "1/2"}],
+        }
+        self.check_model(payload, ())
+        with Catalog() as catalog:
+            catalog.save_model("model", payload)
+            catalog.create_task("task", {"only": ("model", None, 1)})
+            upgrade(catalog)
+            with self.assertRaises(UnknownSymbol):
+                Classifier(catalog).classify("task", ["x"])
+
+
 def demo():
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "demo.sqlite"
@@ -208,7 +317,8 @@ def suite(mode):
         return unittest.TestSuite(loader.loadTestsFromTestCase(getattr(business, name))
                                   for name in ("SDK1Tests", "SDK2Tests", "CatalogTests"))
     return unittest.TestSuite((loader.loadTestsFromModule(business),
-                              loader.loadTestsFromTestCase(MigrationTests)))
+                               loader.loadTestsFromTestCase(MigrationTests),
+                               loader.loadTestsFromTestCase(CompilerCrossTests)))
 
 
 def main():
